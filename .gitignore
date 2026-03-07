@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+*.wav
+!vameval_400m_tts.wav
+*.egg-info/

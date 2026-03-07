@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vameval-audio"
+version = "0.1.0"
+description = "Generate WAV audio tracks for VAMEVAL shuttle test sessions."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Tarek Ziadé", email = "tarek@ziade.org" },
+]
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+tts = [
+  "pyttsx3>=2.90",
+]
+
+[project.scripts]
+vameval-audio = "vameval_audio.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vameval_audio"]
