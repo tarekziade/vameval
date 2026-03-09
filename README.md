@@ -6,7 +6,8 @@ Generate a WAV sound track for a VAMEVAL running test.
 
 - Emits periodic beeps for each distance marker.
 - Increases speed by stage.
-- Optionally adds spoken announcements (`--tts` with `pyttsx3`).
+- Optionally adds spoken announcements (`--tts` with Kokoro-TTS via Transformers).
+- Builds three tracks: `beeps` (timing), `voice` (announcements), then a mixed output.
 
 ## Install
 
@@ -16,7 +17,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-With speech announcements:
+With speech announcements (Kokoro + Transformers):
 
 ```bash
 pip install -e '.[tts]'
@@ -31,7 +32,7 @@ vameval-audio --output vameval.wav --vma-max 20 --start-speed 8 --increment 0.5 
 Enable announcements:
 
 ```bash
-vameval-audio --tts --lang fr --tts-rate 130 --verbose
+vameval-audio --tts --lang fr --tts-rate 130 --beep-output beeps.wav --voice-output voice.wav --verbose
 ```
 
 ## Makefile workflow
@@ -48,6 +49,8 @@ make install-tts
 make run-tts
 ```
 
+Note: Generation is Kokoro-only. The app uses the configured Kokoro model and can run it via local runtime or Hugging Face Inference transport depending on environment capabilities.
+
 ## VAMEVAL Protocol (Default Preset)
 
 - Track length: `400 m`
@@ -55,16 +58,17 @@ make run-tts
 - Warm-up: `2 min` at `8.0 km/h`
 - Then: `+0.5 km/h` every `1 min`
 - Maximum speed: `20.0 km/h`
-- Spoken announcements: enabled in `make run-tts`
-- Intro voice is played before the timed warmup starts
-- Spoken countdown before test: `4, 3, 2, 1, partez!`
-- Mid-warmup cue (2 min warmup): `Encore une minute`
-- No end-of-stage speech cue (`palier ... passe` removed)
-- Warm-up speech format: `2 minutes` (not `2.0 minutes`)
-- Stage speed speech uses integers when exact (for example `8`, not `8.0`)
-- Marker beep stays regular, plus one distinct higher/longer cue beep at each stage start
+- Spoken announcements: enabled in `make run-tts` (Kokoro-TTS)
+- Before timed warmup starts: `Warmup - 8km/h for 120s.` then `4, 3, 2, 1, go!`
+- At each stage boundary: one high-pitch double-beep cue
+- Right after the stage cue: voice says `starting stage X`
+- Marker beep remains regular inside each stage
 
-Default output file from `make run-tts`: `vameval_400m_tts.wav`
+Default outputs from `make run-tts`:
+
+- Mixed track: `vameval_400m_tts.wav`
+- Beep track: `vameval_400m_beeps.wav`
+- Voice track: `vameval_400m_voice.wav`
 
 ## Result Table (Stopwatch)
 
@@ -103,6 +107,8 @@ If the athlete stops during a stage, use the current stage speed as the result b
 ## Options
 
 - `--output`: output WAV path (default: `vameval_400m_tts.wav` in Makefile, `vameval.wav` in CLI)
+- `--beep-output`: optional output WAV path for beep-only track
+- `--voice-output`: optional output WAV path for voice-only track
 - `--vma-max`: max speed in km/h
 - `--start-speed`: starting speed in km/h
 - `--increment`: speed increment per stage (km/h)
@@ -112,7 +118,11 @@ If the athlete stops during a stage, use the current stage speed as the result b
 - `--beep-freq`: beep frequency in Hz (default: 1000)
 - `--tts`: add spoken announcements
 - `--lang`: language hint for voice selection (`fr`, `en`, ...)
-- `--tts-rate`: speech rate for TTS (default: 140 in CLI, 130 in Makefile)
+- `--tts-rate`: speech-rate hint mapped to Kokoro speed (default: 140 in CLI, 130 in Makefile)
+- `--kokoro-model`: Transformers model id (default: `hexgrad/Kokoro-82M`)
+- `--kokoro-voice`: optional Kokoro voice preset override
+- `--beep-mix-gain`: beep gain used for final mix (default: `0.85`)
+- `--voice-mix-gain`: voice gain used for final mix (default: `1.0`)
 - `--verbose`: print stage progress
 
 ## Legacy script style

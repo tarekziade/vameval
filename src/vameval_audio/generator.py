@@ -1,14 +1,8 @@
 from __future__ import annotations
 
+import io
 import math
-import os
-import shutil
-import tempfile
-import time
 import wave
-import aifc
-import subprocess
-import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -17,7 +11,11 @@ import numpy as np
 SAMPLE_RATE = 44_100
 BEEP_DURATION_SECONDS = 0.12
 STAGE_START_CUE_FREQ = 1_800.0
-STAGE_START_CUE_DURATION_SECONDS = 0.42
+STAGE_START_CUE_BEEP_DURATION_SECONDS = 0.14
+STAGE_START_CUE_GAP_SECONDS = 0.08
+PRE_START_SECONDS = 5.0
+DEFAULT_KOKORO_MODEL = "hexgrad/Kokoro-82M"
+DEFAULT_KOKORO_SAMPLE_RATE = 24_000
 
 
 @dataclass(frozen=True)
@@ -33,6 +31,10 @@ class VamevalConfig:
     stage_seconds: float = 60.0
     warmup_seconds: float = 0.0
     tts_rate: int = 140
+    kokoro_model: str = DEFAULT_KOKORO_MODEL
+    kokoro_voice: Optional[str] = None
+    beep_mix_gain: float = 0.85
+    voice_mix_gain: float = 1.0
 
 
 def beep(duration: float = BEEP_DURATION_SECONDS, freq: float = 1_000.0) -> np.ndarray:
@@ -48,6 +50,12 @@ def silence(duration: float) -> np.ndarray:
     if duration <= 0:
         return np.zeros(0, dtype=np.float32)
     return np.zeros(int(SAMPLE_RATE * duration), dtype=np.float32)
+
+
+def silence_samples(samples: int) -> np.ndarray:
+    if samples <= 0:
+        return np.zeros(0, dtype=np.float32)
+    return np.zeros(int(samples), dtype=np.float32)
 
 
 def save_wav(filename: str, data: np.ndarray) -> None:
@@ -67,179 +75,234 @@ def save_wav(filename: str, data: np.ndarray) -> None:
         wav_file.writeframes(scaled.tobytes())
 
 
-def _get_tts_engine(tts_rate: int):
-    try:
-        import pyttsx3
-    except ImportError as exc:
-        raise RuntimeError(
-            "TTS requested but pyttsx3 is not installed. Install with: pip install .[tts]"
-        ) from exc
-
-    engine = pyttsx3.init()
-    engine.setProperty("rate", int(tts_rate))
-    return engine
-
-
-def _select_voice(engine, lang: str) -> None:
-    lang_l = lang.lower()
-    for voice in engine.getProperty("voices"):
-        name = getattr(voice, "name", "").lower()
-        voice_id = getattr(voice, "id", "").lower()
-        langs = []
-        for raw_lang in getattr(voice, "languages", []):
-            if isinstance(raw_lang, bytes):
-                langs.append(raw_lang.decode(errors="ignore").lower())
-            else:
-                langs.append(str(raw_lang).lower())
-
-        if lang_l in name or lang_l in voice_id or any(lang_l in l for l in langs):
-            engine.setProperty("voice", voice.id)
-            return
-
-
-def text_to_speech(
-    text: str, engine, lang: str = "fr", tts_rate: int = 140
+def _resample_audio(
+    audio: np.ndarray, source_rate: int, target_rate: int
 ) -> np.ndarray:
-    # On macOS, pyttsx3 often drops queued save_to_file utterances after the first.
-    if sys.platform == "darwin" and shutil.which("say"):
-        audio = _text_to_speech_say(text, lang, tts_rate)
-        if audio.size:
-            return audio
+    if audio.size == 0 or source_rate <= 0 or source_rate == target_rate:
+        return audio.astype(np.float32, copy=False)
 
-    audio = _text_to_speech_engine(text, engine)
-    if audio.size:
-        return audio
-
-    # Safety fallback if engine output is empty.
-    if shutil.which("say"):
-        return _text_to_speech_say(text, lang, tts_rate)
-    return audio
+    src_len = audio.shape[0]
+    duration = src_len / source_rate
+    target_len = max(1, int(round(duration * target_rate)))
+    src_x = np.linspace(0.0, 1.0, src_len, endpoint=False)
+    dst_x = np.linspace(0.0, 1.0, target_len, endpoint=False)
+    return np.interp(dst_x, src_x, audio).astype(np.float32)
 
 
-def _decode_audio_file(path: str) -> np.ndarray:
-    source_rate: int
-    channels: int
-    sample_width: int
-    byte_order: str
-    frames: bytes
-    converted_path = f"{path}.converted.wav"
-    try:
-        try:
-            with wave.open(path, "rb") as wf:
-                source_rate = wf.getframerate()
-                channels = wf.getnchannels()
-                sample_width = wf.getsampwidth()
-                frames = wf.readframes(wf.getnframes())
-                byte_order = "little"
-        except wave.Error:
-            try:
-                with aifc.open(path, "rb") as af:
-                    source_rate = af.getframerate()
-                    channels = af.getnchannels()
-                    sample_width = af.getsampwidth()
-                    frames = af.readframes(af.getnframes())
-                    byte_order = "big"
-            except aifc.Error:
-                # macOS voices may emit compressed AIFF; convert to PCM WAV.
-                subprocess.run(
-                    [
-                        "afconvert",
-                        "-f",
-                        "WAVE",
-                        "-d",
-                        "LEI16@44100",
-                        path,
-                        converted_path,
-                    ],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                with wave.open(converted_path, "rb") as wf:
-                    source_rate = wf.getframerate()
-                    channels = wf.getnchannels()
-                    sample_width = wf.getsampwidth()
-                    frames = wf.readframes(wf.getnframes())
-                    byte_order = "little"
+def _to_mono_float_audio(audio: object) -> np.ndarray:
+    arr = np.asarray(audio)
+    if arr.size == 0:
+        return np.zeros(0, dtype=np.float32)
 
-        if sample_width == 2:
-            dtype = np.dtype("<i2" if byte_order == "little" else ">i2")
-            audio = np.frombuffer(frames, dtype=dtype).astype(np.float32)
-        elif sample_width == 1:
-            dtype = np.dtype("u1" if byte_order == "little" else "i1")
-            audio = np.frombuffer(frames, dtype=dtype).astype(np.float32)
-            if byte_order == "little":
-                audio -= 128.0
-        elif sample_width == 4:
-            dtype = np.dtype("<i4" if byte_order == "little" else ">i4")
-            audio = np.frombuffer(frames, dtype=dtype).astype(np.float32) / 65536.0
-        else:
-            return np.zeros(0, dtype=np.float32)
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        max_abs = float(max(abs(info.min), info.max))
+        arr = arr.astype(np.float32) / max_abs
+    else:
+        arr = arr.astype(np.float32, copy=False)
 
-        if channels > 1 and audio.size:
-            audio = audio.reshape(-1, channels).mean(axis=1)
-
-        if source_rate != SAMPLE_RATE and audio.size:
-            src_len = audio.shape[0]
-            duration = src_len / source_rate
-            target_len = max(1, int(round(duration * SAMPLE_RATE)))
-            src_x = np.linspace(0.0, 1.0, src_len, endpoint=False)
-            dst_x = np.linspace(0.0, 1.0, target_len, endpoint=False)
-            audio = np.interp(dst_x, src_x, audio).astype(np.float32)
-
-        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-        if peak > 0:
-            audio = audio / peak
-        return audio
-    finally:
-        if os.path.exists(converted_path):
-            os.remove(converted_path)
+    if arr.ndim == 1:
+        return arr
+    if arr.ndim == 2:
+        if arr.shape[0] == 1:
+            return arr[0]
+        if arr.shape[1] == 1:
+            return arr[:, 0]
+        if arr.shape[0] <= 8 and arr.shape[1] > 8:
+            return arr.mean(axis=0).astype(np.float32)
+        if arr.shape[1] <= 8 and arr.shape[0] > 8:
+            return arr.mean(axis=1).astype(np.float32)
+        return arr.mean(axis=0).astype(np.float32)
+    return arr.reshape(-1).astype(np.float32)
 
 
-def _text_to_speech_engine(text: str, engine) -> np.ndarray:
-    fd, path = tempfile.mkstemp(suffix=".aiff")
-    os.close(fd)
-    try:
-        engine.save_to_file(text, path)
-        engine.runAndWait()
+def _extract_audio_from_tts_output(output: object) -> tuple[np.ndarray, int]:
+    sampling_rate = DEFAULT_KOKORO_SAMPLE_RATE
+    payload = output
 
-        # Wait for file output completion.
-        for _ in range(60):
-            if os.path.exists(path) and os.path.getsize(path) > 0:
-                break
-            time.sleep(0.05)
-        return _decode_audio_file(path)
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+    if isinstance(payload, list):
+        if not payload:
+            return np.zeros(0, dtype=np.float32), sampling_rate
+        payload = payload[0]
+
+    if isinstance(payload, tuple) and len(payload) >= 2:
+        maybe_rate = payload[1]
+        if isinstance(maybe_rate, (int, float)) and int(maybe_rate) > 0:
+            sampling_rate = int(maybe_rate)
+        payload = payload[0]
+
+    if isinstance(payload, dict):
+        maybe_rate = payload.get("sampling_rate", payload.get("audio_sampling_rate"))
+        if isinstance(maybe_rate, (int, float)) and int(maybe_rate) > 0:
+            sampling_rate = int(maybe_rate)
+        payload = payload.get(
+            "audio", payload.get("waveform", np.zeros(0, dtype=np.float32))
+        )
+
+    audio = _to_mono_float_audio(payload)
+    if audio.size == 0:
+        return audio, sampling_rate
+
+    peak = float(np.max(np.abs(audio)))
+    if peak > 1.0:
+        audio = audio / peak
+    return audio.astype(np.float32), sampling_rate
 
 
-def _text_to_speech_say(text: str, lang: str, tts_rate: int) -> np.ndarray:
-    fd, path = tempfile.mkstemp(suffix=".aiff")
-    os.close(fd)
+def _decode_wav_bytes(payload: bytes) -> tuple[np.ndarray, int]:
+    with wave.open(io.BytesIO(payload), "rb") as wf:
+        source_rate = wf.getframerate()
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        frames = wf.readframes(wf.getnframes())
 
-    voice = None
+    if sample_width == 2:
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 1:
+        audio = (
+            np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0
+        ) / 128.0
+    elif sample_width == 4:
+        audio = (
+            np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2_147_483_648.0
+        )
+    else:
+        raise RuntimeError(
+            f"Unsupported WAV sample width from Kokoro output: {sample_width}"
+        )
+
+    if channels > 1 and audio.size:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return audio.astype(np.float32), source_rate
+
+
+def _select_kokoro_voice(lang: str, override: Optional[str]) -> Optional[str]:
+    if override:
+        return override
     lang_l = lang.lower()
     if lang_l.startswith("fr"):
-        voice = "Thomas"
-    elif lang_l.startswith("en"):
-        voice = "Alex"
+        return "ff_siwis"
+    return "af_heart"
 
-    try:
-        if voice:
-            cmd = ["say", "-v", voice, "-r", str(int(tts_rate)), "-o", path, text]
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if proc.returncode != 0:
-                cmd = ["say", "-r", str(int(tts_rate)), "-o", path, text]
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            cmd = ["say", "-r", str(int(tts_rate)), "-o", path, text]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        return _decode_audio_file(path)
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+def _tts_rate_to_speed(tts_rate: int) -> float:
+    # Keep tts-rate semantics while mapping to Kokoro speed multiplier.
+    return max(0.5, min(2.0, float(tts_rate) / 140.0))
+
+
+class KokoroTransformerTTS:
+    def __init__(
+        self, model_id: str, lang: str, tts_rate: int, voice: Optional[str]
+    ) -> None:
+        self.model_id = model_id
+        self.lang = lang
+        self.voice = _select_kokoro_voice(lang, voice)
+        self.speed = _tts_rate_to_speed(tts_rate)
+        self._pipeline = None
+        self._pipeline_error: Optional[Exception] = None
+        self._inference_client = None
+
+    def _ensure_pipeline(self):
+        if self._pipeline is not None:
+            return self._pipeline
+        if self._pipeline_error is not None:
+            return None
+
+        try:
+            from transformers import pipeline
+        except ImportError as exc:
+            self._pipeline_error = exc
+            return None
+
+        try:
+            self._pipeline = pipeline(
+                "text-to-speech",
+                model=self.model_id,
+                trust_remote_code=True,
+                device=-1,
+            )
+        except Exception as exc:
+            self._pipeline_error = exc
+            return None
+        return self._pipeline
+
+    def _ensure_inference_client(self):
+        if self._inference_client is not None:
+            return self._inference_client
+
+        try:
+            from huggingface_hub import InferenceClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "Kokoro inference transport requires huggingface_hub. "
+                "Install with: pip install huggingface_hub"
+            ) from exc
+
+        self._inference_client = InferenceClient()
+        return self._inference_client
+
+    def synthesize(self, text: str) -> np.ndarray:
+        if not text.strip():
+            return np.zeros(0, dtype=np.float32)
+
+        tts = self._ensure_pipeline()
+        call_attempts: list[dict[str, object]] = []
+        speed = self.speed
+
+        if tts is not None:
+            if self.voice:
+                forward_params = {"voice": self.voice}
+                if abs(speed - 1.0) > 1e-6:
+                    forward_params["speed"] = speed
+                call_attempts.append({"forward_params": forward_params})
+                call_attempts.append({"voice": self.voice, "speed": speed})
+                call_attempts.append({"voice": self.voice})
+
+            if abs(speed - 1.0) > 1e-6:
+                call_attempts.append({"forward_params": {"speed": speed}})
+                call_attempts.append({"speed": speed})
+
+            call_attempts.append({})
+        last_error: Optional[Exception] = None
+
+        for kwargs in call_attempts:
+            try:
+                output = tts(text, **kwargs)
+            except TypeError as exc:
+                last_error = exc
+                continue
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            audio, source_rate = _extract_audio_from_tts_output(output)
+            if audio.size == 0:
+                continue
+            return _resample_audio(audio, source_rate, SAMPLE_RATE)
+
+        # Secondary Kokoro transport: HF Inference API.
+        try:
+            client = self._ensure_inference_client()
+            response = client.text_to_speech(text, model=self.model_id)
+            if isinstance(response, (bytes, bytearray)):
+                payload = bytes(response)
+            else:
+                payload = b"".join(response)
+            audio, source_rate = _decode_wav_bytes(payload)
+            if audio.size:
+                return _resample_audio(audio, source_rate, SAMPLE_RATE)
+        except Exception as exc:
+            last_error = exc
+
+        message = (
+            f"Kokoro-TTS synthesis failed for model '{self.model_id}'. "
+            "Check selected voice/options and runtime dependencies."
+        )
+        if self._pipeline_error is not None:
+            message += f" Local Kokoro load error: {self._pipeline_error}."
+        if last_error is None:
+            raise RuntimeError(message)
+        raise RuntimeError(message) from last_error
 
 
 def _generate_beep_block(
@@ -250,20 +313,101 @@ def _generate_beep_block(
     beep_freq: float,
     beep_duration: float = BEEP_DURATION_SECONDS,
 ) -> np.ndarray:
+    if duration_seconds <= 0:
+        return np.zeros(0, dtype=np.float32)
+
     speed_mps = speed_kmh / 3.6
     marker_interval = distance_marker / speed_mps
-    marker_count = int(math.floor(duration_seconds / marker_interval))
-    elapsed = 0.0
-    parts: list[np.ndarray] = []
-    marker_beep_duration = min(max(0.02, beep_duration), max(0.02, marker_interval - 0.01))
+    marker_count = int(math.floor((duration_seconds - 1e-9) / marker_interval)) + 1
+    marker_beep_duration = min(
+        max(0.02, beep_duration), max(0.02, marker_interval - 0.01)
+    )
+    marker_tone = beep(duration=marker_beep_duration, freq=beep_freq)
 
-    for _ in range(marker_count):
-        parts.append(beep(duration=marker_beep_duration, freq=beep_freq))
-        parts.append(silence(marker_interval - marker_beep_duration))
-        elapsed += marker_interval
+    total_samples = int(round(duration_seconds * SAMPLE_RATE))
+    block = np.zeros(total_samples, dtype=np.float32)
 
-    parts.append(silence(duration_seconds - elapsed))
-    return np.concatenate(parts).astype(np.float32)
+    for idx in range(marker_count):
+        onset_seconds = idx * marker_interval
+        if onset_seconds >= duration_seconds:
+            break
+        start = int(round(onset_seconds * SAMPLE_RATE))
+        if start >= total_samples:
+            continue
+        end = min(total_samples, start + marker_tone.size)
+        block[start:end] = block[start:end] + marker_tone[: end - start]
+
+    return block
+
+
+def _generate_beep_block_with_phase(
+    *,
+    speed_kmh: float,
+    duration_seconds: float,
+    distance_marker: float,
+    beep_freq: float,
+    distance_to_next_marker: float,
+    beep_duration: float = BEEP_DURATION_SECONDS,
+) -> tuple[np.ndarray, float, list[int]]:
+    if duration_seconds <= 0:
+        return np.zeros(0, dtype=np.float32), distance_to_next_marker, []
+
+    speed_mps = speed_kmh / 3.6
+    if speed_mps <= 0:
+        return np.zeros(int(round(duration_seconds * SAMPLE_RATE)), dtype=np.float32), distance_to_next_marker, []
+
+    marker_beep_duration = min(
+        max(0.02, beep_duration), max(0.02, (distance_marker / speed_mps) - 0.01)
+    )
+    marker_tone = beep(duration=marker_beep_duration, freq=beep_freq)
+
+    total_samples = int(round(duration_seconds * SAMPLE_RATE))
+    block = np.zeros(total_samples, dtype=np.float32)
+    marker_offsets: list[int] = []
+
+    t = 0.0
+    dist_to_next = float(distance_to_next_marker)
+    if dist_to_next < 0:
+        dist_to_next = 0.0
+    eps = 1e-9
+
+    while t < duration_seconds - eps:
+        if dist_to_next <= eps:
+            start = int(round(t * SAMPLE_RATE))
+            if start < total_samples:
+                end = min(total_samples, start + marker_tone.size)
+                block[start:end] = block[start:end] + marker_tone[: end - start]
+                marker_offsets.append(start)
+            dist_to_next = distance_marker
+            continue
+
+        dt = dist_to_next / speed_mps
+        remaining = duration_seconds - t
+        if dt >= remaining - eps:
+            dist_to_next = max(0.0, dist_to_next - (speed_mps * remaining))
+            t = duration_seconds
+            break
+
+        t += dt
+        dist_to_next = 0.0
+
+    return block, dist_to_next, marker_offsets
+
+
+def _generate_stage_start_cue() -> np.ndarray:
+    return np.concatenate(
+        [
+            beep(
+                duration=STAGE_START_CUE_BEEP_DURATION_SECONDS,
+                freq=STAGE_START_CUE_FREQ,
+            ),
+            silence(STAGE_START_CUE_GAP_SECONDS),
+            beep(
+                duration=STAGE_START_CUE_BEEP_DURATION_SECONDS,
+                freq=STAGE_START_CUE_FREQ,
+            ),
+        ]
+    ).astype(np.float32)
 
 
 def _trim_silence(audio: np.ndarray, threshold: float = 0.02) -> np.ndarray:
@@ -273,30 +417,6 @@ def _trim_silence(audio: np.ndarray, threshold: float = 0.02) -> np.ndarray:
     if active.size == 0:
         return audio
     return audio[active[0] : active[-1] + 1]
-
-
-def _overlay_voice(
-    base: np.ndarray,
-    voice: np.ndarray,
-    start_sample: int,
-    segment_scale: float = 0.85,
-    speech_scale: float = 1.0,
-) -> np.ndarray:
-    voice = _trim_silence(voice)
-    if base.size == 0 or voice.size == 0:
-        return base
-
-    start = max(0, start_sample)
-    end = min(base.size, start + voice.size)
-    if end <= start:
-        return base
-
-    mixed = base.copy()
-    segment = mixed[start:end]
-    speech = voice[: end - start]
-    # Default behavior mutes underlying beeps during speech for clear intelligibility.
-    mixed[start:end] = (segment * segment_scale) + (speech * speech_scale)
-    return mixed
 
 
 def _mix_signal(
@@ -315,24 +435,46 @@ def _mix_signal(
     return mixed
 
 
-def _append_beep_block(
-    chunks: list[np.ndarray],
-    *,
-    speed_kmh: float,
-    duration_seconds: float,
-    distance_marker: float,
-    beep_freq: float,
-    beep_duration: float = BEEP_DURATION_SECONDS,
-) -> None:
-    chunks.append(
-        _generate_beep_block(
-            speed_kmh=speed_kmh,
-            duration_seconds=duration_seconds,
-            distance_marker=distance_marker,
-            beep_freq=beep_freq,
-            beep_duration=beep_duration,
+def _place_signal(base: np.ndarray, signal: np.ndarray, start_sample: int) -> None:
+    if base.size == 0 or signal.size == 0:
+        return
+
+    src_offset = 0
+    start = start_sample
+    if start < 0:
+        src_offset = -start
+        start = 0
+    if start >= base.size:
+        return
+    if src_offset >= signal.size:
+        return
+
+    available = min(base.size - start, signal.size - src_offset)
+    if available <= 0:
+        return
+    end = start + available
+
+    base[start:end] = base[start:end] + signal[src_offset : src_offset + (end - start)]
+
+
+def mix_tracks(
+    beep_track: np.ndarray,
+    voice_track: np.ndarray,
+    beep_scale: float = 0.85,
+    voice_scale: float = 1.0,
+) -> np.ndarray:
+    if beep_track.size == 0 and voice_track.size == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    length = max(beep_track.size, voice_track.size)
+    mixed = np.zeros(length, dtype=np.float32)
+    if beep_track.size:
+        mixed[: beep_track.size] = mixed[: beep_track.size] + (beep_track * beep_scale)
+    if voice_track.size:
+        mixed[: voice_track.size] = mixed[: voice_track.size] + (
+            voice_track * voice_scale
         )
-    )
+    return mixed
 
 
 def _format_number(value: float) -> str:
@@ -342,7 +484,7 @@ def _format_number(value: float) -> str:
     return f"{value:.1f}".rstrip("0").rstrip(".")
 
 
-def generate_vameval_audio(config: VamevalConfig) -> np.ndarray:
+def _validate_config(config: VamevalConfig) -> None:
     if config.start_speed <= 0:
         raise ValueError("start_speed must be > 0")
     if config.increment <= 0:
@@ -357,121 +499,144 @@ def generate_vameval_audio(config: VamevalConfig) -> np.ndarray:
         raise ValueError("tts_rate must be > 0")
     if config.vma_max < config.start_speed:
         raise ValueError("vma_max must be >= start_speed")
+    if config.beep_mix_gain < 0:
+        raise ValueError("beep_mix_gain must be >= 0")
+    if config.voice_mix_gain < 0:
+        raise ValueError("voice_mix_gain must be >= 0")
+    if "kokoro" not in config.kokoro_model.lower():
+        raise ValueError(
+            "kokoro_model must reference a Kokoro-TTS model (for example: hexgrad/Kokoro-82M)"
+        )
 
-    engine: Optional[object] = None
-    is_french = config.lang.lower().startswith("fr")
+
+def generate_vameval_tracks(
+    config: VamevalConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    _validate_config(config)
+    tts_backend: Optional[KokoroTransformerTTS] = None
     if config.announce:
-        engine = _get_tts_engine(config.tts_rate)
-        _select_voice(engine, config.lang)
+        tts_backend = KokoroTransformerTTS(
+            model_id=config.kokoro_model,
+            lang=config.lang,
+            tts_rate=config.tts_rate,
+            voice=config.kokoro_voice,
+        )
 
-    chunks: list[np.ndarray] = []
+    voice_events: list[tuple[int, np.ndarray]] = []
 
-    # Optional warm-up at start speed, then stage 1 starts at +increment.
+    def synth_voice(text: str) -> np.ndarray:
+        if tts_backend is None:
+            return np.zeros(0, dtype=np.float32)
+        return _trim_silence(tts_backend.synthesize(text))
+
+    test_start_seconds = PRE_START_SECONDS
+    marker_tone = beep(duration=BEEP_DURATION_SECONDS, freq=config.beep_freq)
+    stage_cue = _generate_stage_start_cue()
+
+    timeline: list[tuple[str, int, float, float, float]] = []
+    current_time = test_start_seconds
+
     if config.warmup_seconds > 0:
         if config.verbose:
             print(
-                f"Warmup - {config.start_speed:.1f} km/h for {config.warmup_seconds:.0f}s"
+                f"Warmup - {config.start_speed:.1f} kilometers per hour for {config.warmup_seconds:.0f} seconds"
             )
-
-        warmup_block = _generate_beep_block(
-            speed_kmh=config.start_speed,
-            duration_seconds=config.warmup_seconds,
-            distance_marker=config.distance_marker,
-            beep_freq=config.beep_freq,
+        timeline.append(
+            (
+                "warmup",
+                0,
+                config.start_speed,
+                current_time,
+                current_time + config.warmup_seconds,
+            )
         )
-
-        if config.announce and engine is not None:
-            warmup_minutes = config.warmup_seconds / 60.0
-            minutes_str = _format_number(warmup_minutes)
-            start_speed_str = _format_number(config.start_speed)
-            if is_french:
-                intro = (
-                    f"Echauffement {minutes_str} minutes. "
-                    f"{start_speed_str} kilometres heure."
-                )
-            else:
-                intro = (
-                    f"Warmup {minutes_str} minutes. "
-                    f"{start_speed_str} kilometers per hour."
-                )
-
-            intro_voice = text_to_speech(intro, engine, config.lang, config.tts_rate)
-            # Intro is before the timed warmup block.
-            chunks.append(intro_voice)
-            chunks.append(silence(0.25))
-
-            # For a 2-minute warm-up, inject "Encore une minute" at midpoint.
-            if abs(config.warmup_seconds - 120.0) < 1:
-                mid_text = "Encore une minute" if is_french else "One minute remaining"
-                mid_voice = text_to_speech(mid_text, engine, config.lang, config.tts_rate)
-                midpoint = warmup_block.size // 2
-                warmup_block = _overlay_voice(
-                    warmup_block, mid_voice, midpoint - (mid_voice.size // 2)
-                )
-
-            # Countdown is overlaid at the end so stage 1 can start exactly at warmup end.
-            if is_french:
-                countdown_text = "4, 3, 2, 1, Partez!"
-            else:
-                countdown_text = "4, 3, 2, 1, Go!"
-            countdown_voice = text_to_speech(
-                countdown_text, engine, config.lang, config.tts_rate
-            )
-            warmup_block = _overlay_voice(
-                warmup_block,
-                countdown_voice,
-                warmup_block.size - countdown_voice.size - int(0.10 * SAMPLE_RATE),
-            )
-
-        chunks.append(warmup_block)
+        current_time += config.warmup_seconds
         speed = config.start_speed + config.increment
     else:
         speed = config.start_speed
-        if config.announce and engine is not None:
-            if is_french:
-                countdown_text = "4, 3, 2, 1, Partez!"
-            else:
-                countdown_text = "4, 3, 2, 1, Go!"
-            chunks.append(text_to_speech(countdown_text, engine, config.lang, config.tts_rate))
-            chunks.append(silence(0.1))
 
     stage = 1
-
     while speed <= config.vma_max + 1e-9:
         if config.verbose:
             print(f"Stage {stage} - {speed:.1f} km/h")
-
-        stage_block = _generate_beep_block(
-            speed_kmh=speed,
-            duration_seconds=config.stage_seconds,
-            distance_marker=config.distance_marker,
-            beep_freq=config.beep_freq,
-            beep_duration=BEEP_DURATION_SECONDS,
-        )
-        stage_cue = beep(duration=STAGE_START_CUE_DURATION_SECONDS, freq=STAGE_START_CUE_FREQ)
-        stage_block = _mix_signal(stage_block, stage_cue, 0, signal_scale=1.35)
-
-        if config.announce and engine is not None:
-            speed_str = _format_number(speed)
-            if is_french:
-                start_text = f"Palier {stage}. {speed_str} kilometres heure"
-            else:
-                start_text = f"Stage {stage}. {speed_str} kilometers per hour"
-
-            start_voice = text_to_speech(start_text, engine, config.lang, config.tts_rate)
-            # Keep the start cue audible, then announce the stage.
-            stage_block = _overlay_voice(
-                stage_block,
-                start_voice,
-                int((STAGE_START_CUE_DURATION_SECONDS + 0.05) * SAMPLE_RATE),
-            )
-
-        chunks.append(stage_block)
-
+        timeline.append(("stage", stage, speed, current_time, current_time + config.stage_seconds))
+        current_time += config.stage_seconds
         speed += config.increment
         stage += 1
 
-    if not chunks:
+    total_samples = int(round(current_time * SAMPLE_RATE))
+    if total_samples <= 0:
         raise RuntimeError("No audio generated with the provided configuration.")
+    beep_track = np.zeros(total_samples, dtype=np.float32)
 
-    return np.concatenate(chunks).astype(np.float32)
+    def _place_signal_seconds(
+        track: np.ndarray, signal: np.ndarray, when_seconds: float, signal_scale: float = 1.0
+    ) -> None:
+        signal_to_place = signal if abs(signal_scale - 1.0) < 1e-9 else signal * signal_scale
+        _place_signal(track, signal_to_place, int(round(when_seconds * SAMPLE_RATE)))
+
+    # Countdown voice is anchored to the fixed pre-start window.
+    if config.announce:
+        countdown_text = "4, 3, 2, 1, go!"
+        countdown_voice = synth_voice(countdown_text)
+        countdown_start = int(round(test_start_seconds * SAMPLE_RATE)) - countdown_voice.size
+        voice_events.append((countdown_start, countdown_voice))
+
+        if config.warmup_seconds > 0:
+            start_speed_str = _format_number(config.start_speed)
+            warmup_seconds_str = _format_number(config.warmup_seconds)
+            intro = (
+                f"Warmup - {start_speed_str} kilometers per hour for {warmup_seconds_str} seconds."
+            )
+            intro_voice = synth_voice(intro)
+            intro_gap = int(0.12 * SAMPLE_RATE)
+            intro_start = countdown_start - intro_gap - intro_voice.size
+            voice_events.append((intro_start, intro_voice))
+
+    # First marker beep at test start.
+    last_beep_time = test_start_seconds
+    _place_signal_seconds(beep_track, marker_tone, last_beep_time)
+
+    # Marker beeps stay continuous across speed changes.
+    for segment_kind, stage_number, speed_kmh, _segment_start, segment_end in timeline:
+        marker_interval = config.distance_marker / (speed_kmh / 3.6)
+        next_beep_time = last_beep_time + marker_interval
+        first_marker_time: Optional[float] = None
+
+        while next_beep_time < segment_end - 1e-9:
+            _place_signal_seconds(beep_track, marker_tone, next_beep_time)
+            if segment_kind == "stage" and first_marker_time is None:
+                first_marker_time = next_beep_time
+            last_beep_time = next_beep_time
+            next_beep_time += marker_interval
+
+        if segment_kind == "stage" and first_marker_time is not None:
+            _place_signal_seconds(beep_track, stage_cue, first_marker_time, signal_scale=1.35)
+            if config.announce:
+                start_text = f"starting stage {stage_number}"
+                start_voice = synth_voice(start_text)
+                voice_start = int(
+                    round(
+                        (first_marker_time + (stage_cue.size / SAMPLE_RATE) + 0.03)
+                        * SAMPLE_RATE
+                    )
+                )
+                voice_events.append((voice_start, start_voice))
+
+    voice_track = np.zeros(beep_track.size, dtype=np.float32)
+
+    for start_sample, voice in voice_events:
+        _place_signal(voice_track, _trim_silence(voice), start_sample)
+
+    mixed_track = mix_tracks(
+        beep_track,
+        voice_track,
+        beep_scale=config.beep_mix_gain,
+        voice_scale=config.voice_mix_gain,
+    )
+    return beep_track, voice_track, mixed_track
+
+
+def generate_vameval_audio(config: VamevalConfig) -> np.ndarray:
+    _, _, mixed_track = generate_vameval_tracks(config)
+    return mixed_track

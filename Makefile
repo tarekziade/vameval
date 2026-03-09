@@ -4,13 +4,15 @@ VENV_PYTHON := $(VENV_DIR)/bin/python
 VENV_PIP := $(VENV_DIR)/bin/pip
 TRACK_METERS ?= 400
 OUTPUT ?= vameval_$(TRACK_METERS)m_tts.wav
+BEEP_OUTPUT ?= vameval_$(TRACK_METERS)m_beeps.wav
+VOICE_OUTPUT ?= vameval_$(TRACK_METERS)m_voice.wav
 DISTANCE ?= 20
 START_SPEED ?= 8.0
 VMA_MAX ?= 20.0
 INCREMENT ?= 0.5
 STAGE_SECONDS ?= 60
 WARMUP_SECONDS ?= 120
-TTS_LANG ?= fr
+TTS_LANG ?= en
 TTS_RATE ?= 130
 
 .PHONY: help venv install install-tts run run-tts clean
@@ -21,13 +23,13 @@ help:
 	@echo "  make install      Install project (editable)"
 	@echo "  make install-tts  Install project with TTS extras"
 	@echo "  make run          Generate WAV with default VAMEVAL profile (no TTS)"
-	@echo "  make run-tts      Generate WAV with default VAMEVAL profile + speech"
+	@echo "  make run-tts      Generate mixed/beep/voice WAVs with Kokoro-TTS speech"
 	@echo "  make clean        Remove generated WAV files"
 	@echo ""
 	@echo "Install once before running: make install (or make install-tts for speech)"
 	@echo ""
 	@echo "Defaults: 400m track, 20m markers, 8km/h start, 2min warmup, countdown, +0.5km/h per minute up to 20km/h"
-	@echo "Speech defaults: French with slower voice (TTS_RATE=$(TTS_RATE))"
+	@echo "Speech defaults: Kokoro-TTS, French, TTS_RATE=$(TTS_RATE)"
 	@echo "Custom output: make run-tts OUTPUT=my_test.wav"
 
 venv:
@@ -52,6 +54,8 @@ run: venv
 run-tts: venv
 	PYTHONPATH=src $(VENV_PYTHON) -m vameval_audio.cli \
 		--output $(OUTPUT) \
+		--beep-output $(BEEP_OUTPUT) \
+		--voice-output $(VOICE_OUTPUT) \
 		--vma-max $(VMA_MAX) \
 		--start-speed $(START_SPEED) \
 		--increment $(INCREMENT) \
