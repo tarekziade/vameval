@@ -594,21 +594,36 @@ def generate_vameval_tracks(
             voice_events.append((intro_start, intro_voice))
 
     # First marker beep at test start.
-    last_beep_time = test_start_seconds
-    _place_signal_seconds(beep_track, marker_tone, last_beep_time)
+    _last_beep_time = test_start_seconds
+    _place_signal_seconds(beep_track, marker_tone, _last_beep_time)
+    distance_to_next_marker = config.distance_marker
 
-    # Marker beeps stay continuous across speed changes.
+    # Marker beeps stay physically continuous across speed changes by carrying
+    # the remaining distance to the next marker from one segment to the next.
     for segment_kind, stage_number, speed_kmh, _segment_start, segment_end in timeline:
-        marker_interval = config.distance_marker / (speed_kmh / 3.6)
-        next_beep_time = last_beep_time + marker_interval
+        segment_duration = segment_end - _segment_start
         first_marker_time: Optional[float] = None
 
-        while next_beep_time < segment_end - 1e-9:
-            _place_signal_seconds(beep_track, marker_tone, next_beep_time)
-            if segment_kind == "stage" and first_marker_time is None:
-                first_marker_time = next_beep_time
-            last_beep_time = next_beep_time
-            next_beep_time += marker_interval
+        (
+            block,
+            distance_to_next_marker,
+            marker_offsets,
+        ) = _generate_beep_block_with_phase(
+            speed_kmh=speed_kmh,
+            duration_seconds=segment_duration,
+            distance_marker=config.distance_marker,
+            beep_freq=config.beep_freq,
+            distance_to_next_marker=distance_to_next_marker,
+            beep_duration=BEEP_DURATION_SECONDS,
+        )
+
+        segment_start_sample = int(round(_segment_start * SAMPLE_RATE))
+        _place_signal(beep_track, block, segment_start_sample)
+
+        if marker_offsets:
+            _last_beep_time = _segment_start + (marker_offsets[-1] / SAMPLE_RATE)
+            if segment_kind == "stage":
+                first_marker_time = _segment_start + (marker_offsets[0] / SAMPLE_RATE)
 
         if segment_kind == "stage" and first_marker_time is not None:
             _place_signal_seconds(beep_track, stage_cue, first_marker_time, signal_scale=1.35)
